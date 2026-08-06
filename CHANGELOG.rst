@@ -1,3 +1,9 @@
+Unreleased
+----------
+
+* Preserve label-only EAD tokens when composing message 1 instead of encoding
+  them with an empty byte string value.
+
 Version 2.0.1
 -------------
 
