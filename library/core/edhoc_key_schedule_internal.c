@@ -233,9 +233,14 @@ int edhoc_key_schedule_auth_kind(const struct edhoc_context *ctx,
 		case EDHOC_METHOD_3:
 			*kind = EDHOC_AUTH_STATIC_DH;
 			return EDHOC_SUCCESS;
+		case EDHOC_METHOD_4:
+			/* Nobody authenticates in message 2 of EDHOC-PSK; the
+			 * kind still selects the key schedule step. */
+			*kind = EDHOC_AUTH_PSK;
+			return EDHOC_SUCCESS;
 		default:
 			EDHOC_LOG_ERR("Invalid method: %d",
-				      ctx->negotiation.selected_method);
+				      (int)ctx->negotiation.selected_method);
 			return EDHOC_ERROR_NOT_PERMITTED;
 		}
 
@@ -249,16 +254,19 @@ int edhoc_key_schedule_auth_kind(const struct edhoc_context *ctx,
 		case EDHOC_METHOD_3:
 			*kind = EDHOC_AUTH_STATIC_DH;
 			return EDHOC_SUCCESS;
+		case EDHOC_METHOD_4:
+			*kind = EDHOC_AUTH_PSK;
+			return EDHOC_SUCCESS;
 		default:
 			EDHOC_LOG_ERR("Invalid method: %d",
-				      ctx->negotiation.selected_method);
+				      (int)ctx->negotiation.selected_method);
 			return EDHOC_ERROR_NOT_PERMITTED;
 		}
 
 	case EDHOC_MESSAGE_1:
 	case EDHOC_MESSAGE_4:
 	default:
-		EDHOC_LOG_ERR("Invalid message: %d", ctx->state.message);
+		EDHOC_LOG_ERR("Invalid message: %d", (int)ctx->state.message);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 }
@@ -337,7 +345,8 @@ int edhoc_key_schedule_prk_initial(struct edhoc_context *ctx)
 	if (EDHOC_TH_STATE_2 != ctx->state.th.stage ||
 	    EDHOC_PRK_STATE_INVALID != ctx->state.prk_state) {
 		EDHOC_LOG_ERR("Invalid state for PRK_2e: %d, %d",
-			      ctx->state.th.stage, ctx->state.prk_state);
+			      (int)ctx->state.th.stage,
+			      (int)ctx->state.prk_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
@@ -369,7 +378,7 @@ int edhoc_key_schedule_prk_advance(struct edhoc_context *ctx,
 	}
 
 	if (!edhoc_is_initiator(ctx) && !edhoc_is_responder(ctx)) {
-		EDHOC_LOG_ERR("Invalid role: %d", ctx->state.role);
+		EDHOC_LOG_ERR("Invalid role: %d", (int)ctx->state.role);
 		return EDHOC_ERROR_NOT_PERMITTED;
 	}
 
@@ -378,13 +387,14 @@ int edhoc_key_schedule_prk_advance(struct edhoc_context *ctx,
 
 	if (EDHOC_SUCCESS != ret) {
 		EDHOC_LOG_ERR("Invalid message for PRK: %d",
-			      ctx->state.message);
+			      (int)ctx->state.message);
 		return ret;
 	}
 
 	if (params.prk_source_state != ctx->state.prk_state) {
-		EDHOC_LOG_ERR("Bad PRK state: %d, %d", ctx->state.prk_state,
-			      params.prk_source_state);
+		EDHOC_LOG_ERR("Bad PRK state: %d, %d",
+			      (int)ctx->state.prk_state,
+			      (int)params.prk_source_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
@@ -418,6 +428,7 @@ int edhoc_key_schedule_prk_advance(struct edhoc_context *ctx,
 
 		if (EDHOC_SUCCESS != ret) {
 			EDHOC_LOG_ERR("Compute salt: %d", ret);
+			edhoc_zeroize(ctx, salt, EDHOC_MEM_ALLOC_SIZE(salt));
 			EDHOC_MEM_FREE(salt);
 			return ret;
 		}
@@ -431,6 +442,7 @@ int edhoc_key_schedule_prk_advance(struct edhoc_context *ctx,
 
 		if (EDHOC_SUCCESS != ret) {
 			EDHOC_LOG_ERR("Static DH shared secret: %d", ret);
+			edhoc_zeroize(ctx, salt, EDHOC_MEM_ALLOC_SIZE(salt));
 			EDHOC_MEM_FREE(salt);
 			return ret;
 		}
@@ -453,11 +465,68 @@ int edhoc_key_schedule_prk_advance(struct edhoc_context *ctx,
 		return EDHOC_SUCCESS;
 	}
 
+	case EDHOC_AUTH_PSK: {
+		/* draft-ietf-lake-edhoc-psk: 4 - PRK_3e2m = PRK_2e. */
+		if (EDHOC_MESSAGE_2 == ctx->state.message) {
+			edhoc_key_slot_move(ctx, params.prk_target,
+					    params.prk_source);
+			ctx->state.prk_state = params.prk_target_state;
+			return EDHOC_SUCCESS;
+		}
+
+		/* PRK_4e3m = EDHOC_Extract(SALT_4e3m, PSK). The pre-shared key
+		 * comes from the credentials callback, so nothing is agreed
+		 * here. */
+		if (NULL == private_key_id) {
+			EDHOC_LOG_ERR("Missing pre-shared key");
+			return EDHOC_ERROR_INVALID_ARGUMENT;
+		}
+
+		const size_t hash_len =
+			edhoc_selected_cipher_suite(ctx)->hash_length;
+
+		EDHOC_MEM_ALLOC(uint8_t, salt, hash_len);
+
+		if (NULL == salt) {
+			EDHOC_LOG_ERR("Memory allocation failed");
+			return EDHOC_ERROR_NOT_ENOUGH_MEMORY;
+		}
+
+		ret = comp_salt(ctx, &params, salt, EDHOC_MEM_ALLOC_SIZE(salt));
+
+		if (EDHOC_SUCCESS != ret) {
+			EDHOC_LOG_ERR("Compute salt: %d", ret);
+			edhoc_zeroize(ctx, salt, EDHOC_MEM_ALLOC_SIZE(salt));
+			EDHOC_MEM_FREE(salt);
+			return ret;
+		}
+
+		EDHOC_LOG_HEXDUMP_DBG(salt, EDHOC_MEM_ALLOC_SIZE(salt),
+				      "PRK salt");
+
+		ret = edhoc_kdf_extract(ctx, private_key_id, salt,
+					EDHOC_MEM_ALLOC_SIZE(salt),
+					params.prk_target);
+
+		edhoc_zeroize(ctx, salt, EDHOC_MEM_ALLOC_SIZE(salt));
+		EDHOC_MEM_FREE(salt);
+
+		if (EDHOC_SUCCESS != ret) {
+			EDHOC_LOG_ERR("Extract PRK: %d", ret);
+			return EDHOC_ERROR_CRYPTO_FAILURE;
+		}
+
+		ctx->state.prk_state = params.prk_target_state;
+
+		return EDHOC_SUCCESS;
+	}
+
 	default:
-		EDHOC_LOG_ERR("Invalid authentication kind: %d", kind);
+		EDHOC_LOG_ERR("Invalid authentication kind: %d", (int)kind);
 		return EDHOC_ERROR_NOT_PERMITTED;
 	}
 }
+
 int edhoc_key_schedule_prk_out(struct edhoc_context *ctx)
 {
 	if (NULL == ctx) {
@@ -467,8 +536,8 @@ int edhoc_key_schedule_prk_out(struct edhoc_context *ctx)
 
 	if (EDHOC_TH_STATE_4 != ctx->state.th.stage ||
 	    EDHOC_PRK_STATE_4E3M != ctx->state.prk_state) {
-		EDHOC_LOG_ERR("Bad state: %d, %d", ctx->state.th.stage,
-			      ctx->state.prk_state);
+		EDHOC_LOG_ERR("Bad state: %d, %d", (int)ctx->state.th.stage,
+			      (int)ctx->state.prk_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
@@ -513,7 +582,7 @@ int edhoc_key_schedule_prk_out_update(struct edhoc_context *ctx,
 	}
 
 	if (EDHOC_PRK_STATE_OUT != ctx->state.prk_state) {
-		EDHOC_LOG_ERR("Bad state: %d", ctx->state.prk_state);
+		EDHOC_LOG_ERR("Bad state: %d", (int)ctx->state.prk_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
@@ -561,7 +630,7 @@ int edhoc_key_schedule_prk_exporter(struct edhoc_context *ctx)
 	}
 
 	if (EDHOC_PRK_STATE_OUT != ctx->state.prk_state) {
-		EDHOC_LOG_ERR("Bad state: %d", ctx->state.prk_state);
+		EDHOC_LOG_ERR("Bad state: %d", (int)ctx->state.prk_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 

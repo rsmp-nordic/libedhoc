@@ -64,6 +64,19 @@ struct aead_params {
 	enum edhoc_prk_state prk_state;
 };
 
+/**
+ * \brief Everything that separates the keystream of message 2 from that of
+ *        message 3 (draft-ietf-lake-edhoc-psk: 4).
+ */
+struct keystream_params {
+	/** Handle of the PRK the keystream is derived from. */
+	enum edhoc_key_slot_id prk_slot;
+	/** EDHOC_KDF label of the keystream. */
+	int32_t label;
+	/** Transcript hash the message must be at. */
+	enum edhoc_th_state th_stage;
+};
+
 /* Module interface variables and constants -------------------------------- */
 /* Static variables and constants ------------------------------------------ */
 /* Static function declarations -------------------------------------------- */
@@ -79,21 +92,40 @@ struct aead_params {
 STATIC int comp_aead_params(const struct edhoc_context *ctx,
 			    struct aead_params *params);
 
+/**
+ * \brief Select the keystream parameters of the message being handled.
+ *
+ * \param[in] ctx               EDHOC context.
+ * \param[out] params           On success, the selected parameters.
+ *
+ * \return EDHOC_SUCCESS on success, otherwise failure.
+ */
+STATIC int comp_keystream_params(const struct edhoc_context *ctx,
+				 struct keystream_params *params);
+
 /* Static function definitions --------------------------------------------- */
 
 STATIC int comp_aead_params(const struct edhoc_context *ctx,
 			    struct aead_params *params)
 {
+	const bool is_psk =
+		(EDHOC_METHOD_4 == ctx->negotiation.selected_method);
+
 	switch (ctx->state.message) {
 	case EDHOC_MESSAGE_3:
+		/* draft-ietf-lake-edhoc-psk: 4 - CIPHERTEXT_3B is keyed from
+		 * PRK_4e3m, which message 3 has already derived. */
 		*params = (struct aead_params){
-			.prk_slot = EDHOC_KEY_SLOT_PRK_3E2M,
+			.prk_slot = is_psk ? EDHOC_KEY_SLOT_PRK_4E3M :
+					     EDHOC_KEY_SLOT_PRK_3E2M,
 			.key_slot = EDHOC_KEY_SLOT_K_3,
 			.key_label = EDHOC_KDF_LABEL_K_3,
 			.iv_label = EDHOC_KDF_LABEL_IV_3,
 			.th_stage = EDHOC_TH_STATE_3,
-			.prk_state = EDHOC_PRK_STATE_3E2M,
+			.prk_state = is_psk ? EDHOC_PRK_STATE_4E3M :
+					      EDHOC_PRK_STATE_3E2M,
 		};
+
 		return EDHOC_SUCCESS;
 
 	case EDHOC_MESSAGE_4:
@@ -114,9 +146,52 @@ STATIC int comp_aead_params(const struct edhoc_context *ctx,
 	}
 }
 
+STATIC int comp_keystream_params(const struct edhoc_context *ctx,
+				 struct keystream_params *params)
+{
+	switch (ctx->state.message) {
+	case EDHOC_MESSAGE_2: {
+		/* For methods 0/2 PRK_2e was moved into PRK_3e2m, so read
+		 * whichever handle still holds it. */
+		const enum edhoc_key_slot_id prk_2e_slot =
+			edhoc_key_slot_present(ctx, EDHOC_KEY_SLOT_PRK_2E) ?
+				EDHOC_KEY_SLOT_PRK_2E :
+				EDHOC_KEY_SLOT_PRK_3E2M;
+
+		*params = (struct keystream_params){
+			.prk_slot = prk_2e_slot,
+			.label = EDHOC_KDF_LABEL_KEYSTREAM_2,
+			.th_stage = EDHOC_TH_STATE_2,
+		};
+
+		return EDHOC_SUCCESS;
+	}
+
+	case EDHOC_MESSAGE_3:
+		/* Only EDHOC-PSK protects message 3 with a keystream. */
+		if (EDHOC_METHOD_4 != ctx->negotiation.selected_method) {
+			return EDHOC_ERROR_BAD_STATE;
+		}
+
+		*params = (struct keystream_params){
+			.prk_slot = EDHOC_KEY_SLOT_PRK_3E2M,
+			.label = EDHOC_KDF_LABEL_KEYSTREAM_3A,
+			.th_stage = EDHOC_TH_STATE_3,
+		};
+
+		return EDHOC_SUCCESS;
+
+	case EDHOC_MESSAGE_1:
+	case EDHOC_MESSAGE_4:
+	default:
+		return EDHOC_ERROR_BAD_STATE;
+	}
+}
+
 /* Module interface function definitions ----------------------------------- */
 
-int edhoc_cipher_aad_length(const struct edhoc_context *ctx, size_t *length)
+int edhoc_cipher_aad_length(const struct edhoc_context *ctx,
+			    size_t external_aad_length, size_t *length)
 {
 	if (NULL == ctx || NULL == length) {
 		EDHOC_LOG_ERR("Invalid arguments");
@@ -128,19 +203,20 @@ int edhoc_cipher_aad_length(const struct edhoc_context *ctx, size_t *length)
 	len += sizeof(EDHOC_CIPHER_AAD_CONTEXT) +
 	       edhoc_cbor_tstr_head_length(sizeof(EDHOC_CIPHER_AAD_CONTEXT));
 	len += edhoc_cbor_bstr_head_length(0);
-	len += ctx->state.th.length +
-	       edhoc_cbor_bstr_head_length(ctx->state.th.length);
+	len += external_aad_length +
+	       edhoc_cbor_bstr_head_length(external_aad_length);
 
 	*length = len;
 
 	return EDHOC_SUCCESS;
 }
 
-int edhoc_cipher_derive(struct edhoc_context *ctx, uint8_t *iv,
+int edhoc_cipher_derive(struct edhoc_context *ctx, const uint8_t *external_aad,
+			size_t external_aad_length, uint8_t *iv,
 			size_t iv_length, uint8_t *aad, size_t aad_length)
 {
-	if (NULL == ctx || NULL == iv || 0 == iv_length || NULL == aad ||
-	    0 == aad_length) {
+	if (NULL == ctx || NULL == external_aad || 0 == external_aad_length ||
+	    NULL == iv || 0 == iv_length || NULL == aad || 0 == aad_length) {
 		EDHOC_LOG_ERR("Invalid arguments");
 		return EDHOC_ERROR_INVALID_ARGUMENT;
 	}
@@ -150,19 +226,19 @@ int edhoc_cipher_derive(struct edhoc_context *ctx, uint8_t *iv,
 
 	if (EDHOC_SUCCESS != ret) {
 		EDHOC_LOG_ERR("Invalid message for AEAD: %d",
-			      ctx->state.message);
+			      (int)ctx->state.message);
 		return ret;
 	}
 
 	if (params.th_stage != ctx->state.th.stage) {
-		EDHOC_LOG_ERR("Invalid TH state: %d, %d", ctx->state.th.stage,
-			      params.th_stage);
+		EDHOC_LOG_ERR("Invalid TH state: %d, %d",
+			      (int)ctx->state.th.stage, (int)params.th_stage);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
 	if (params.prk_state != ctx->state.prk_state) {
-		EDHOC_LOG_ERR("Invalid PRK state: %d, %d", ctx->state.prk_state,
-			      params.prk_state);
+		EDHOC_LOG_ERR("Invalid PRK state: %d, %d",
+			      (int)ctx->state.prk_state, (int)params.prk_state);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
@@ -177,7 +253,8 @@ int edhoc_cipher_derive(struct edhoc_context *ctx, uint8_t *iv,
 			       csuite->aead_key_length);
 
 	if (EDHOC_SUCCESS != ret) {
-		EDHOC_LOG_ERR("Derive K_%d: %d", ctx->state.message + 1, ret);
+		EDHOC_LOG_ERR("Derive K_%d: %d", (int)ctx->state.message + 1,
+			      ret);
 		return ret;
 	}
 
@@ -188,23 +265,24 @@ int edhoc_cipher_derive(struct edhoc_context *ctx, uint8_t *iv,
 				   iv, iv_length);
 
 	if (EDHOC_SUCCESS != ret) {
-		EDHOC_LOG_ERR("Derive IV_%d: %d", ctx->state.message + 1, ret);
+		EDHOC_LOG_ERR("Derive IV_%d: %d", (int)ctx->state.message + 1,
+			      ret);
 		return ret;
 	}
 
 	const struct enc_structure cose_enc_0 = {
 		.enc_structure_protected.value = NULL,
 		.enc_structure_protected.len = 0,
-		.enc_structure_external_aad.value = ctx->state.th.value,
-		.enc_structure_external_aad.len = ctx->state.th.length,
+		.enc_structure_external_aad.value = external_aad,
+		.enc_structure_external_aad.len = external_aad_length,
 	};
 
 	size_t len = 0;
 	ret = cbor_encode_enc_structure(aad, aad_length, &cose_enc_0, &len);
 
 	if (ZCBOR_SUCCESS != ret) {
-		EDHOC_LOG_ERR("CBOR enc AAD_%d: %d", ctx->state.message + 1,
-			      ret);
+		EDHOC_LOG_ERR("CBOR enc AAD_%d: %d",
+			      (int)ctx->state.message + 1, ret);
 		return EDHOC_ERROR_CBOR_FAILURE;
 	}
 
@@ -231,7 +309,7 @@ int edhoc_cipher_encrypt(const struct edhoc_context *ctx, const uint8_t *iv,
 
 	if (EDHOC_SUCCESS != ret) {
 		EDHOC_LOG_ERR("Invalid message for AEAD: %d",
-			      ctx->state.message);
+			      (int)ctx->state.message);
 		return ret;
 	}
 
@@ -242,7 +320,7 @@ int edhoc_cipher_encrypt(const struct edhoc_context *ctx, const uint8_t *iv,
 
 	if (EDHOC_SUCCESS != ret) {
 		EDHOC_LOG_ERR("Encrypt CIPHERTEXT_%d: %d",
-			      ctx->state.message + 1, ret);
+			      (int)ctx->state.message + 1, ret);
 		return EDHOC_ERROR_CRYPTO_FAILURE;
 	}
 
@@ -269,7 +347,7 @@ int edhoc_cipher_decrypt(const struct edhoc_context *ctx, const uint8_t *iv,
 
 	if (EDHOC_SUCCESS != ret) {
 		EDHOC_LOG_ERR("Invalid message for AEAD: %d",
-			      ctx->state.message);
+			      (int)ctx->state.message);
 		return ret;
 	}
 
@@ -281,8 +359,8 @@ int edhoc_cipher_decrypt(const struct edhoc_context *ctx, const uint8_t *iv,
 
 	if (EDHOC_SUCCESS != ret || plaintext_length != len) {
 		EDHOC_LOG_ERR("Decrypt CIPHERTEXT_%d: %d, %zu, %zu",
-			      ctx->state.message + 1, ret, plaintext_length,
-			      len);
+			      (int)ctx->state.message + 1, ret,
+			      plaintext_length, len);
 		return EDHOC_ERROR_CRYPTO_FAILURE;
 	}
 
@@ -297,27 +375,28 @@ int edhoc_cipher_keystream(const struct edhoc_context *ctx, uint8_t *keystream,
 		return EDHOC_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (EDHOC_TH_STATE_2 != ctx->state.th.stage) {
-		EDHOC_LOG_ERR("Invalid TH state for keystream_2: %d",
-			      ctx->state.th.stage);
+	struct keystream_params params = { 0 };
+	int ret = comp_keystream_params(ctx, &params);
+
+	if (EDHOC_SUCCESS != ret) {
+		EDHOC_LOG_ERR("Invalid message for keystream: %d",
+			      (int)ctx->state.message);
+		return ret;
+	}
+
+	if (params.th_stage != ctx->state.th.stage) {
+		EDHOC_LOG_ERR("Invalid TH state for keystream: %d",
+			      (int)ctx->state.th.stage);
 		return EDHOC_ERROR_BAD_STATE;
 	}
 
-	/* For methods 0/2 PRK_2e was moved into PRK_3e2m, so read whichever
-	 * handle still holds it. */
-	const void *prk_2e_key_id =
-		edhoc_key_slot_present(ctx, EDHOC_KEY_SLOT_PRK_2E) ?
-			edhoc_key_slot_id(ctx, EDHOC_KEY_SLOT_PRK_2E) :
-			edhoc_key_slot_id(ctx, EDHOC_KEY_SLOT_PRK_3E2M);
-
-	const int ret = edhoc_kdf_expand_raw(ctx, prk_2e_key_id,
-					     EDHOC_KDF_LABEL_KEYSTREAM_2,
-					     ctx->state.th.value,
-					     ctx->state.th.length, keystream,
-					     keystream_length);
+	ret = edhoc_kdf_expand_raw(ctx, edhoc_key_slot_id(ctx, params.prk_slot),
+				   params.label, ctx->state.th.value,
+				   ctx->state.th.length, keystream,
+				   keystream_length);
 
 	if (EDHOC_SUCCESS != ret) {
-		EDHOC_LOG_ERR("Derive KEYSTREAM_2: %d, %zu", ret,
+		EDHOC_LOG_ERR("Derive keystream: %d, %zu", ret,
 			      keystream_length);
 		return ret;
 	}

@@ -6,7 +6,7 @@
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.21)
-project(libedhoc VERSION 2.1.1 LANGUAGES C)
+project(libedhoc VERSION 2.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -40,7 +40,7 @@ if(LIBEDHOC_ENABLE_TESTS)
     add_subdirectory(tests)
 endif()
 if(LIBEDHOC_ENABLE_FUZZING)
-    add_subdirectory(tests/linux/fuzz)
+    add_subdirectory(tests/host/fuzz)
 endif()
 
 # --- Install / packaging -----------------------------------------------------
